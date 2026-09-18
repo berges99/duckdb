@@ -1,0 +1,87 @@
+name: FK CI baseline comparison
+on:
+  push:
+    branches: [codex/fk-ci-diagnostics]
+    paths: [.github/workflows/fk-ci-diagnostics.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  compare:
+    name: Linux Relassert - ${{ matrix.label }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    container:
+      image: ghcr.io/duckdb/duckdb-ci/manylinux_2_28_amd64_main:20260909-38521d2f
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: upstream-base
+            ref: c5447020d3d176f66391d7c50661a45ecf1d2dc1
+          - label: pr
+            ref: 831a0ad922c6f1f14545353fdf9721f9d8c13c98
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ matrix.ref }}
+          fetch-depth: 0
+      - name: Build assertion-enabled test binary
+        shell: bash
+        run: |
+          cmake -S . -B build/relassert -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DFORCE_DEBUG=ON \
+            -DFORCE_ASSERT=ON -DCRASH_ON_ASSERT=ON -DREDUCE_SYMBOLS=ON \
+            -DBUILD_SHELL=OFF
+          cmake --build build/relassert --target unittest -j 3
+      - name: Run isolated tests with timings
+        shell: bash
+        env:
+          DIAGNOSTIC_LABEL: ${{ matrix.label }}
+        run: |
+          mkdir -p diagnostic-results
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess, time
+          tests = [
+              'test/sql/cte/materialized/materialized_cte_order_preservation.test',
+              'test/sql/cte/materialized/materialized_cte_parallel_buffered.test',
+              'test/sql/join/pair_dependent_full_outer_join_subquery_bindings.test',
+              'test/sql/join/pair_dependent_join_subquery.test',
+              'test/sql/join/pair_dependent_outer_reference_subquery.test',
+              'test/sql/match_recognize/test_match_recognize_limits.test',
+              'test/sql/parallelism/interquery/concurrent_set_async_threads_read_ahead.test',
+              'test/sql/trigger/create_trigger_catalog.test',
+              'test/sql/constraints/foreignkey/test_fk_eager_constraint_checking.test',
+          ]
+          if os.environ['DIAGNOSTIC_LABEL'] == 'pr':
+              tests.append('test/sql/constraints/foreignkey/fk_update_nonpk_columns.test')
+          results = []
+          for test in tests:
+              start = time.monotonic()
+              path = pathlib.Path('diagnostic-results') / (pathlib.Path(test).stem + '.log')
+              print('START', test, flush=True)
+              with path.open('w') as output:
+                  try:
+                      run = subprocess.run(['build/relassert/test/unittest', test], stdout=output,
+                                           stderr=subprocess.STDOUT, timeout=360)
+                      status = 'passed' if run.returncode == 0 else 'failed'
+                  except subprocess.TimeoutExpired:
+                      status = 'timeout'
+              result = dict(test=test, status=status, seconds=round(time.monotonic()-start, 2))
+              results.append(result)
+              print(json.dumps(result), flush=True)
+              print(path.read_text()[-4000:], flush=True)
+              pathlib.Path('diagnostic-results/results.json').write_text(json.dumps(results, indent=2))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('## ' + os.environ['DIAGNOSTIC_LABEL'] + '\n\n')
+              for row in results:
+                  summary.write(f"- {row['status']} ({row['seconds']}s): {row['test']}\n")
+          if any(row['status'] != 'passed' for row in results):
+              raise SystemExit(1)
+          PY
+      - name: Upload diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fk-ci-${{ matrix.label }}
+          path: diagnostic-results/
